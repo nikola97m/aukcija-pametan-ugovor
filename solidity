@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity >=0.6.0 < 0.7.0;
+
+contract myAuction {
+    
+    address owner;
+    uint256 bidIncrement;
+    uint256 auctionEndTime;
+    bool ownerHasWithdrawn;
+    bool canceledAuction;
+    uint256 goodsNumber;
+    uint256 goodsCounter = 0;
+    
+    struct Goods {
+        address goodsOwner;
+        string goodsState;
+        string goodsType;
+        uint256 startingPrice;
+    }
+    
+    Goods[] public goods;
+    
+    enum State {inited, bidding, finished, canceled}
+    State state;
+    
+    mapping(address => uint256[1000]) public fundsByBidder;
+    mapping(uint256 => uint256) newBidToGoods;
+    mapping(uint256 => uint256) public highestBindingBidToGoods;
+    mapping(uint256 => uint256) public highestBidToGoods;
+    mapping(uint256 => address) public highestBidderToGoods;
+    
+    event LogBid(address bidder, uint256 indexed bid, address highestBidder, uint256 highestBid, uint256 highestBindingBid);
+    event LogWithdrawal(address withdrawer, address withdrawalAccount, uint256 amount);
+    event LogCanceled();
+    
+    constructor(address _owner, uint256 _goodsNumber, uint256 _bidIncrement)
+        public
+    {
+        require (_owner != address(0), "Address of owner cannot be zero!");
+        require (_goodsNumber > 0, "Number of goods needs to be higher than zero!");
+        require (_bidIncrement > 0, "Bid increment needs to be higher than zero!");
+        owner = _owner;
+        goodsNumber = _goodsNumber;
+        bidIncrement = _bidIncrement;
+        state = State.inited;
+    }
+    
+    // Unos robe koja je namenjena za javnu prodaju (aukciju) od strane poste
+    function entryOfGoods(string memory _goodsState, string memory _goodsType, uint256 _startingPrice)
+        public
+        onlyOwner
+        onlyInInitedPhase
+    {
+        require(goodsCounter < goodsNumber, "The desired number of goods already entered!");
+        goods.push(Goods(owner, _goodsState, _goodsType, _startingPrice));
+        goodsCounter += 1;
+    }
+    
+    // Posta zapocinje aukciju unosom vremena trajanja aukcije
+    function start(uint256 _biddingTime)
+        public
+        onlyOwner
+        onlyInInitedPhase
+    {
+        auctionEndTime = now + _biddingTime;
+        state = State.bidding;
+    }
+    
+    // Otkazivanje aukcije pre isteka vremena trajanja ukoliko je potrebno
+    function cancelAuction()
+        public
+        onlyOwner
+        onlyNotCanceledAndNotFinished
+        returns(bool success)
+    {
+        canceledAuction = true;
+        state = State.canceled;
+        emit LogCanceled();
+        return true;
+    }
+    
+    // Korisnici ostavljaju licitaciju za zeljene artikle 
+    function placeBid(uint256 _goodsId)
+        public
+        payable
+        onlyNotOwner
+        onlyInBiddingPhase
+        returns(bool success)
+    {
+        if(!checkIfEnded()) {
+            require(msg.value != 0, "Bid needs to be higher than zero!");
+            require(_goodsId > 0 && _goodsId <= goodsNumber, "Goods ID has to be higher than zero and less than number of goods!");
+            require((msg.value + fundsByBidder[msg.sender][_goodsId - 1]) >= goods[_goodsId - 1].startingPrice, "Bid needs to be higher or equal to starting price!");
+            newBidToGoods[_goodsId - 1] = fundsByBidder[msg.sender][_goodsId - 1] + msg.value;
+            require(newBidToGoods[_goodsId - 1] > highestBindingBidToGoods[_goodsId - 1], "Bid is not higher than highest binding bid!");
+            highestBidToGoods[_goodsId - 1] = fundsByBidder[highestBidderToGoods[_goodsId - 1]][_goodsId - 1];
+            fundsByBidder[msg.sender][_goodsId - 1] = newBidToGoods[_goodsId - 1];
+            if(newBidToGoods[_goodsId - 1] == highestBidToGoods[_goodsId - 1]) {
+                revert("New bid is equal to the current highest bid!");
+            } else if(newBidToGoods[_goodsId - 1] < highestBidToGoods[_goodsId - 1]) {
+                highestBindingBidToGoods[_goodsId - 1] = min(newBidToGoods[_goodsId - 1] + bidIncrement, highestBidToGoods[_goodsId - 1]);
+            } else {
+                if(msg.sender != highestBidderToGoods[_goodsId - 1]) {
+                    highestBidderToGoods[_goodsId - 1] = msg.sender;
+                    highestBindingBidToGoods[_goodsId - 1] = min(newBidToGoods[_goodsId - 1], highestBidToGoods[_goodsId - 1]+ bidIncrement);
+                }
+                highestBidToGoods[_goodsId - 1] = newBidToGoods[_goodsId - 1];
+            }
+            emit LogBid(
+                msg.sender,
+                newBidToGoods[_goodsId - 1],
+                highestBidderToGoods[_goodsId - 1],
+                highestBidToGoods[_goodsId - 1],
+                highestBindingBidToGoods[_goodsId - 1]
+                );
+            return true;
+        } else {
+            revert("Auction ended!");
+        }
+    }
+    
+    // Nakon isteka vremena predvidjenog za javnu prodaju, posta objavljuje kraj aukcije
+    function finalizing()
+        public
+        onlyOwner
+        onlyInBiddingPhase
+    {
+        state = State.finished;
+    }
+    
+    // Korisnici koji su imali pobednicke licitacije za svaki od artikala mogu preuzeti vlasnistvo nad njima.
+    // Ostali korisnici mogu povuci svoje licitacije.
+    function withdrawAndTransferOwnership(uint256 _goodsId)
+        public
+        onlyCanceledOrFinished
+        returns (bool success)
+    {
+        address withdrawalAccount;
+        uint256 withdrawalAmount;
+        bool ownershipTranfered;
+        require(_goodsId > 0 && _goodsId <= goodsNumber, "Goods ID has to be higher than zero and less than number of goods!");
+        if(checkIfEnded() || canceledAuction) {
+            if(state == State.canceled){
+                withdrawalAccount = msg.sender;
+                withdrawalAmount = fundsByBidder[withdrawalAccount][_goodsId - 1];
+            } else {
+                if (msg.sender == owner) {
+                    withdrawalAccount = highestBidderToGoods[_goodsId - 1];
+                    withdrawalAmount = highestBindingBidToGoods[_goodsId - 1];
+                    ownerHasWithdrawn = true;
+                } else if (msg.sender == highestBidderToGoods[_goodsId - 1]) {
+                    withdrawalAccount = highestBidderToGoods[_goodsId - 1];
+                    goods[_goodsId - 1].goodsOwner = withdrawalAccount;
+                    ownershipTranfered = true;
+                    if (ownerHasWithdrawn) {
+                        withdrawalAmount = fundsByBidder[highestBidderToGoods[_goodsId - 1]][_goodsId - 1];
+                    } else {
+                        withdrawalAmount = fundsByBidder[highestBidderToGoods[_goodsId - 1]][_goodsId - 1] - highestBindingBidToGoods[_goodsId - 1];
+                    }
+                } else {
+                    withdrawalAccount = msg.sender;
+                    withdrawalAmount = fundsByBidder[withdrawalAccount][_goodsId - 1];
+                }
+            }
+        } else {
+            revert("Auction in progress!");
+        }
+        require(withdrawalAmount > 0 || ownershipTranfered, "There is nothing to withdraw or no need for onwership transfer for this address!");
+        fundsByBidder[withdrawalAccount][_goodsId - 1] -= withdrawalAmount;
+        msg.sender.transfer(withdrawalAmount);
+        LogWithdrawal(msg.sender, withdrawalAccount, withdrawalAmount);
+        return true;
+    }
+    
+    // Vraca najvecu licitaciju za trazeni artikal
+    function checkHighestBid(uint256 _goodsId)
+        public
+        view
+        returns(uint256)
+    {
+        require(_goodsId > 0 && _goodsId <= goodsNumber, "Goods ID has to be higher than zero and less than number of goods!");
+        return fundsByBidder[highestBidderToGoods[_goodsId - 1]][_goodsId - 1];
+    }
+    
+    // Provera da li se aukcija zavrsila
+    function checkIfEnded()
+        public
+        view
+        returns (bool success)
+    {
+        if(auctionEndTime <= now) return true;
+        return false;
+    }
+    
+    // Vraca minimum dva broja
+    function min(uint256 a, uint256 b)
+        private
+        pure
+        returns (uint256)
+    {
+        if(a < b) return a;
+        return b;
+    }
+    
+    // Modifikator za proveru pozivanja funkcije od strane vlasnika pametnog ugovora (posta)
+    modifier onlyOwner {
+        require(msg.sender == owner, "Only owner can call this function!");
+        _;
+    }
+    
+    // Modifikator za proveru pozivanja funkcije od strane korisnika
+    modifier onlyNotOwner {
+        require(msg.sender != owner, "Owner can't call this function!");
+        _;
+    }
+    
+    // Modifikator za proveru stanja
+    modifier onlyInInitedPhase {
+        require(state == State.inited, "State needs to be inited!");
+        _;
+    }
+    
+    // Modifikator za proveru stanja
+    modifier onlyInBiddingPhase {
+        require(state == State.bidding, "State needs to be bidding!");
+        _;
+    }
+    
+    // Modifikator za proveru stanja
+    modifier onlyNotCanceledAndNotFinished {
+        require(state != State.canceled && state != State.finished, "State can't be canceled and finished!");
+        _;
+    }
+    
+    // Modifikator za proveru stanja
+    modifier onlyCanceledOrFinished {
+        require(state == State.canceled || state == State.finished, "State needs to be canceled or finished!");
+        _;
+    }
+}
